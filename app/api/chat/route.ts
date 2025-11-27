@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 import { answerQuestion } from "@/lib/helper";
 import { createUIMessageStreamResponse } from "ai";
 
