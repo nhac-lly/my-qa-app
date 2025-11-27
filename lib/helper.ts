@@ -1,8 +1,10 @@
 import fs from "fs";
 import path from "path";
 import Papa from "papaparse";
-import { pipeline } from '@huggingface/transformers';
+import { pipeline, env } from '@huggingface/transformers';
 import { queryArobidMCP } from "./mcp-client";
+
+env.cacheDir = "/tmp/.cache"
 
 // Load embedding model once
 const embedder = await pipeline("feature-extraction");
