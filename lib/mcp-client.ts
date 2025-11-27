@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 /**
  * MCP Client for Arobid MCP Server
  * Handles communication with the Arobid MCP server using JSON-RPC 2.0 protocol
@@ -10,8 +11,15 @@
  * are the recommended approaches.
  */
 
-const AROBID_MCP_URL = process.env.AROBID_MCP_URL || "https://hao-mcp.vercel.app/mcp";
-const AROBID_BACKEND_URL = process.env.AROBID_BACKEND_URL || "https://gw-prod.arobid.com";
+// Client-side environment variables - use Next.js public env vars or defaults
+const AROBID_MCP_URL = 
+  (typeof window !== "undefined" && (window as any).__AROBID_MCP_URL__) ||
+  (typeof process !== "undefined" && process.env.NEXT_PUBLIC_AROBID_MCP_URL) ||
+  "https://hao-mcp.vercel.app/mcp";
+const AROBID_BACKEND_URL = 
+  (typeof window !== "undefined" && (window as any).__AROBID_BACKEND_URL__) ||
+  (typeof process !== "undefined" && process.env.NEXT_PUBLIC_AROBID_BACKEND_URL) ||
+  "https://gw-prod.arobid.com";
 
 interface MCPRequest {
   jsonrpc: "2.0";

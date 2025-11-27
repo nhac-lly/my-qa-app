@@ -3,13 +3,10 @@
 import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
 import { AssistantRuntimeProvider } from "@assistant-ui/react";
-import {
-  AssistantChatTransport,
-  useChatRuntime,
-} from "@assistant-ui/react-ai-sdk";
+import { useChatRuntime } from "@assistant-ui/react-ai-sdk";
+import { ClientSideTransport } from "@/lib/client-transport";
 import * as Dialog from "@radix-ui/react-dialog";
 import { useState, useEffect } from "react";
-import { usePathname } from "next/navigation";
 import { Thread } from "@/components/assistant-ui/thread";
 
 const geistSans = Geist({
@@ -26,15 +23,11 @@ function AssistantModal({
   open,
   onClose,
   title,
-  runtime,
 }: {
   open: boolean;
   onClose: () => void;
   title: string;
-  runtime: ReturnType<typeof useChatRuntime>;
 }) {
-  // Runtime provider is now at layout level, so we don't need it here
-  // But we keep the runtime prop for type consistency
   return (
     <Dialog.Root open={open} onOpenChange={(isOpen) => !isOpen && onClose()}>
       <Dialog.Portal>
@@ -66,24 +59,20 @@ function AssistantModal({
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   // Persist chat modal state across navigation using localStorage
-  const [open, setOpen] = useState(false);
-  const pathname = usePathname();
+  const [open, setOpen] = useState(() => {
+    // Initialize from localStorage synchronously to avoid cascading renders
+    if (typeof window !== "undefined") {
+      return localStorage.getItem("chatModalOpen") === "true";
+    }
+    return false;
+  });
 
   // Create runtime at layout level - this preserves chat context across modal open/close
   // The runtime persists as long as the layout component exists
+  // Use client-side transport implementing required methods
   const runtime = useChatRuntime({
-    transport: new AssistantChatTransport({
-      api: "/api/chat",
-    }),
+    transport: new ClientSideTransport(),
   });
-
-  // Load chat state from localStorage on mount
-  useEffect(() => {
-    const savedState = localStorage.getItem("chatModalOpen");
-    if (savedState === "true") {
-      setOpen(true);
-    }
-  }, []);
 
   // Save chat state to localStorage when it changes
   useEffect(() => {
@@ -124,7 +113,6 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
             open={open}
             onClose={() => setOpen(false)}
             title="Ask me anything"
-            runtime={runtime}
           />
         </AssistantRuntimeProvider>
       </body>

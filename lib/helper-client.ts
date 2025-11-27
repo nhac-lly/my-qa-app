@@ -1,19 +1,18 @@
-import fs from "fs";
-import path from "path";
+"use client";
+
 import Papa from "papaparse";
-import { pipeline } from '@huggingface/transformers';
+import { pipeline, env } from "@huggingface/transformers";
 import { queryArobidMCP } from "./mcp-client";
 
-// Load embedding model once
-const embedder = await pipeline("feature-extraction");
+// Disable local model files for client-side (use CDN)
+env.allowLocalModels = false;
+env.allowRemoteModels = true;
 
 type CsvRow = {
   ["CÂU HỎI GỐC"]?: string;
   ["TRẢ LỜI CHUẨN"]?: string;
   ["SHORT QUESTION"]?: string;
 };
-
-const faqCsvPath = path.join(process.cwd(), "data", "chatbot-faq.csv");
 
 // Neutral/general questions that are always available
 const neutralQuestions: { q: string; a: string }[] = [
@@ -26,18 +25,38 @@ const neutralQuestions: { q: string; a: string }[] = [
   { q: "Help", a: "I'm here to help! You can ask me questions from the FAQ, get information about Arobid features, or navigate to different pages by saying 'go to [page name]'." },
 ];
 
-function loadFaq(): { q: string; a: string }[] {
+// Global state for FAQ data and embeddings
+let faqData: { q: string; a: string }[] | null = null;
+let faqEmbeddings: number[][] | null = null;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let embedder: any = null;
+let loadingPromise: Promise<void> | null = null;
+
+/**
+ * Load FAQ data from CSV file
+ */
+async function loadFaq(): Promise<{ q: string; a: string }[]> {
+  if (faqData) {
+    return faqData;
+  }
+
   const allFaqs: { q: string; a: string }[] = [];
   
   // Always include neutral questions first
   allFaqs.push(...neutralQuestions);
   
   try {
-    const csv = fs.readFileSync(faqCsvPath, "utf-8");
+    // Fetch CSV from public folder
+    const response = await fetch("/data/chatbot-faq.csv");
+    if (!response.ok) {
+      throw new Error(`Failed to fetch FAQ CSV: ${response.statusText}`);
+    }
+    const csv = await response.text();
+    
     const result = Papa.parse<CsvRow>(csv, {
       header: true,
       delimiter: ";",
-      skipEmptyLines: false, // Don't skip empty lines to preserve multi-line fields
+      skipEmptyLines: false,
       newline: "\n",
       quoteChar: '"',
       escapeChar: '"',
@@ -50,18 +69,14 @@ function loadFaq(): { q: string; a: string }[] {
         let answer = row["TRẢ LỜI CHUẨN"]?.trim() || "";
         
         // Normalize line endings but preserve newlines for formatting
-        answer = answer.replace(/\r\n/g, "\n"); // Normalize Windows line endings
-        answer = answer.replace(/\r/g, "\n"); // Normalize Mac line endings
-        // Normalize multiple consecutive newlines to double newline (paragraph break)
+        answer = answer.replace(/\r\n/g, "\n");
+        answer = answer.replace(/\r/g, "\n");
         answer = answer.replace(/\n{3,}/g, "\n\n");
-        // Normalize multiple spaces/tabs to single space (but preserve single spaces and newlines)
         answer = answer.replace(/[ \t]+/g, " ");
-        // Ensure there's a space after newline if the next line doesn't start with space
         answer = answer.replace(/\n([^\s\n])/g, "\n$1");
         
-        // Debug: Log if answer seems to have spacing issues
         if (answer.includes("Hoàn") && !answer.includes("Hoàn toàn")) {
-          console.warn(`[helper.ts] Potential spacing issue in row ${index + 1}: "${answer.substring(0, 100)}"`);
+          console.warn(`[helper-client.ts] Potential spacing issue in row ${index + 1}: "${answer.substring(0, 100)}"`);
         }
         
         if (!question || !answer) return null;
@@ -69,37 +84,70 @@ function loadFaq(): { q: string; a: string }[] {
       })
       .filter((item): item is { q: string; a: string } => Boolean(item));
 
-    // Add CSV FAQs to the list
     if (fromCsv.length > 0) {
       allFaqs.push(...fromCsv);
     }
   } catch (error) {
-    console.error("[helper.ts] Failed to load FAQ CSV:", error);
-    // If CSV fails, we still have neutral questions, so we can return them
+    console.error("[helper-client.ts] Failed to load FAQ CSV:", error);
   }
 
-  // Return all FAQs (neutral + CSV), or at least neutral questions if CSV failed
-  return allFaqs.length > 0 ? allFaqs : neutralQuestions;
+  faqData = allFaqs.length > 0 ? allFaqs : neutralQuestions;
+  return faqData;
 }
 
-const faq = loadFaq();
+/**
+ * Initialize the embedding model and precompute embeddings
+ */
+async function initializeEmbeddings(): Promise<void> {
+  if (embedder && faqEmbeddings) {
+    return;
+  }
 
-// Helper function to extract a single embedding vector from a tensor.
-// The transformers pipeline returns tensors with shape [tokens, hidden_dim]
-// (or [batch, tokens, hidden_dim]). We average over the token dimension so
-// every embedding has the same hidden_dim length (e.g. 384 for MiniLM).
-function extractEmbedding(tensor: { data: unknown; dims?: number[] }): number[] {
+  if (loadingPromise) {
+    return loadingPromise;
+  }
+
+  loadingPromise = (async () => {
+    try {
+      console.log("[helper-client.ts] Loading embedding model...");
+      embedder = await pipeline("feature-extraction", "Xenova/all-MiniLM-L6-v2");
+      console.log("[helper-client.ts] Embedding model loaded");
+
+      const faq = await loadFaq();
+      console.log("[helper-client.ts] Computing embeddings for", faq.length, "FAQ items...");
+      
+      const faqEmbeddingsRaw = await Promise.all(
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        faq.map(item => (embedder as (text: string) => Promise<any>)(item.q))
+      );
+      
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      faqEmbeddings = faqEmbeddingsRaw.map((tensor: any) => {
+        return extractEmbedding(tensor);
+      });
+      
+      console.log("[helper-client.ts] Embeddings computed");
+    } catch (error) {
+      console.error("[helper-client.ts] Failed to initialize embeddings:", error);
+      throw error;
+    }
+  })();
+
+  return loadingPromise;
+}
+
+// Helper function to extract a single embedding vector from a tensor
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function extractEmbedding(tensor: any): number[] {
   const rawData =
     tensor.data instanceof Array ? tensor.data : Array.from(tensor.data as ArrayLike<number>);
 
   const dims = tensor.dims ?? [rawData.length];
 
   if (dims.length === 1) {
-    // Already a flat vector
     return rawData;
   }
 
-  // Determine hidden size (last dimension) and total number of vectors
   const hiddenSize = dims[dims.length - 1];
   const totalVectors = rawData.length / hiddenSize;
 
@@ -107,7 +155,6 @@ function extractEmbedding(tensor: { data: unknown; dims?: number[] }): number[] 
     return rawData;
   }
 
-  // Average over all vectors (tokens) to get a single embedding
   const averaged = new Array(hiddenSize).fill(0);
 
   for (let vecIndex = 0; vecIndex < totalVectors; vecIndex++) {
@@ -126,12 +173,7 @@ function extractEmbedding(tensor: { data: unknown; dims?: number[] }): number[] 
   return averaged;
 }
 
-// Precompute embeddings
-const faqEmbeddingsRaw = await Promise.all(faq.map(item => embedder(item.q)));
-// Extract embedding vectors using consistent extraction
-const faqEmbeddings = faqEmbeddingsRaw.map(tensor => extractEmbedding(tensor));
-
-function cosineSimilarity(vecA: number[], vecB: number[]) {
+function cosineSimilarity(vecA: number[], vecB: number[]): number {
   const dot = vecA.reduce((sum, a, i) => sum + a * vecB[i], 0);
   const normA = Math.sqrt(vecA.reduce((sum, a) => sum + a*a, 0));
   const normB = Math.sqrt(vecB.reduce((sum, b) => sum + b*b, 0));
@@ -153,9 +195,9 @@ function levenshteinDistance(str1: string, str2: string): number {
         dp[i][j] = dp[i - 1][j - 1];
       } else {
         dp[i][j] = Math.min(
-          dp[i - 1][j] + 1,     // deletion
-          dp[i][j - 1] + 1,     // insertion
-          dp[i - 1][j - 1] + 1  // substitution
+          dp[i - 1][j] + 1,
+          dp[i][j - 1] + 1,
+          dp[i - 1][j - 1] + 1
         );
       }
     }
@@ -195,13 +237,11 @@ const NAVIGATION_ROUTES: Record<string, string> = {
 
 /**
  * Detect navigation intent from query
- * Returns the route path if navigation is detected, null otherwise
  */
 function detectNavigation(query: string): string | null {
   const normalized = query.trim().toLowerCase();
   console.log("[detectNavigation] Checking query:", normalized);
   
-  // Navigation keywords - order matters! Check longer phrases first
   const navKeywords = [
     "navigate to",
     "take me to",
@@ -214,18 +254,14 @@ function detectNavigation(query: string): string | null {
     "navigate",
   ];
   
-  // Check if query contains navigation keywords
   for (const keyword of navKeywords) {
     if (normalized.includes(keyword)) {
-      // Extract the route name after the keyword
       const parts = normalized.split(keyword);
       if (parts.length > 1) {
         const afterKeyword = parts[1]?.trim();
         console.log("[detectNavigation] Found keyword:", keyword, "afterKeyword:", afterKeyword);
         if (afterKeyword) {
-          // Try to find matching route
           for (const [routeName, routePath] of Object.entries(NAVIGATION_ROUTES)) {
-            // Check if the route name matches or is contained in afterKeyword
             if (afterKeyword === routeName || afterKeyword.startsWith(routeName + " ") || afterKeyword === routeName) {
               console.log("[detectNavigation] Matched route:", routeName, "->", routePath);
               return routePath;
@@ -236,7 +272,6 @@ function detectNavigation(query: string): string | null {
     }
   }
   
-  // Direct route name check (e.g., "home", "settings")
   for (const [routeName, routePath] of Object.entries(NAVIGATION_ROUTES)) {
     if (normalized === routeName || normalized === `go ${routeName}` || normalized === `open ${routeName}`) {
       console.log("[detectNavigation] Direct match:", routeName, "->", routePath);
@@ -248,22 +283,21 @@ function detectNavigation(query: string): string | null {
   return null;
 }
 
-// Answer function
+/**
+ * Answer function - client-side version
+ */
 export async function answerQuestion(query: string): Promise<string | { type: "navigation"; route: string; message: string }> {
-  // Normalize query for exact matching - trim and lowercase
   const normalizedQuery = (query || "").trim().toLowerCase();
   
-  // Debug: Log the query being processed
   console.log("answerQuestion called with query:", JSON.stringify(query));
   console.log("normalizedQuery:", JSON.stringify(normalizedQuery));
   
-  // Return default answer for empty queries
   if (!normalizedQuery) {
     console.log("Empty query, returning default");
     return "Sorry, I don't have an answer for that yet.";
   }
   
-  // Check for navigation intent first (before FAQ and MCP check)
+  // Check for navigation intent first
   const navigationRoute = detectNavigation(query);
   if (navigationRoute) {
     const routeName = navigationRoute === "/" ? "home" : navigationRoute.slice(1);
@@ -286,43 +320,35 @@ export async function answerQuestion(query: string): Promise<string | { type: "n
         return mcpAnswer;
       }
       console.log("MCP did not provide an answer, falling back to FAQ");
-      // Continue with FAQ matching if MCP doesn't provide an answer
     } catch (error) {
-      console.error("[helper.ts] Error querying MCP:", error);
-      // Continue with FAQ matching if MCP fails
+      console.error("[helper-client.ts] Error querying MCP:", error);
     }
   }
   
-  // Always check FAQ first - MCP will only be used as fallback if FAQ doesn't have an answer
-  // Debug: Log FAQ items for comparison
-  console.log("FAQ items:", faq.map(item => ({ q: item.q, normalized: item.q.trim().toLowerCase() })));
+  // Initialize embeddings if not already done
+  await initializeEmbeddings();
   
-  // Fast path: Check for exact string match first (case-insensitive)
+  const faq = await loadFaq();
+  
+  // Fast path: Check for exact string match first
   const exactMatch = faq.find(item => {
     const normalizedFAQ = item.q.trim().toLowerCase();
-    const matches = normalizedFAQ === normalizedQuery;
-    if (matches) {
-      console.log(`Exact match found: "${item.q}" -> "${item.a}"`);
-    } else {
-      console.log(`Comparing: "${normalizedFAQ}" === "${normalizedQuery}" = ${matches}`);
-    }
-    return matches;
+    return normalizedFAQ === normalizedQuery;
   });
   
   if (exactMatch) {
+    console.log(`Exact match found: "${exactMatch.q}" -> "${exactMatch.a}"`);
     return exactMatch.a;
   }
   
-  // Fuzzy matching: Check for similar strings (handles typos like "Hii" -> "Hi")
-  // Only do fuzzy matching for short queries (<= 10 chars) to avoid false positives
+  // Fuzzy matching for short queries
   if (normalizedQuery.length <= 10) {
-    const FUZZY_THRESHOLD = 0.8; // 80% similarity required for fuzzy match
+    const FUZZY_THRESHOLD = 0.8;
     let bestFuzzyScore = 0;
     let bestFuzzyMatch: typeof faq[0] | null = null;
     
     for (const item of faq) {
       const normalizedFAQ = item.q.trim().toLowerCase();
-      // Only check fuzzy match if FAQ item is also short
       if (normalizedFAQ.length <= 10) {
         const similarity = stringSimilarity(normalizedQuery, normalizedFAQ);
         if (similarity > bestFuzzyScore && similarity >= FUZZY_THRESHOLD) {
@@ -340,46 +366,28 @@ export async function answerQuestion(query: string): Promise<string | { type: "n
   
   console.log("No exact or fuzzy match found, trying embeddings...");
   
-  // Use embedding-based similarity for approximate matches
-  // Use original query (not normalized) for embedding generation
-  const queryEmbeddingTensor = await embedder(query.trim());
-  // Extract embedding vector using the same method as precomputed embeddings
+  // Use embedding-based similarity
+  if (!embedder || !faqEmbeddings) {
+    console.error("[helper-client.ts] Embeddings not initialized");
+    return "Sorry, I don't have an answer for that yet.";
+  }
+  
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const queryEmbeddingTensor = await (embedder as (text: string) => Promise<any>)(query.trim());
   const queryEmbedding = extractEmbedding(queryEmbeddingTensor);
   
-  // Debug: Log embedding dimensions
   console.log(`Query embedding dimension: ${queryEmbedding.length}`);
-  console.log(`FAQ embeddings dimensions: ${faqEmbeddings.map((emb, i) => `${i}:${emb.length}`).join(", ")}`);
   
-  // Minimum similarity threshold - lower for short queries
-  // For very short queries (1-5 chars), use a lower threshold since embeddings
-  // for short text can vary more
   const isShortQuery = normalizedQuery.length <= 5;
   const SIMILARITY_THRESHOLD = isShortQuery ? 0.4 : 0.5;
   
   let bestScore = -1;
   let bestAnswer = "Sorry, I don't have an answer for that yet.";
   let bestIndex = -1;
-
-  // Log dimensions for debugging
-  console.log(`Query embedding dimension: ${queryEmbedding.length}`);
   
   for (let i = 0; i < faqEmbeddings.length; i++) {
     const embArray = faqEmbeddings[i];
-    
-    // Ensure vectors have the same length (dimension)
-    // Dimension = number of values in the embedding vector
-    // For all-MiniLM-L6-v2 model, this should be 384
-    // if (queryEmbedding.length !== embArray.length) {
-    //   console.warn(
-    //     `Dimension mismatch: query has ${queryEmbedding.length} dimensions, ` +
-    //     `FAQ[${i}] ("${faq[i].q}") has ${embArray.length} dimensions. ` +
-    //     `Skipping this comparison.`
-    //   );
-    //   continue; // Skip this FAQ item - can't compare different sized vectors
-    // }
-    
     const score = cosineSimilarity(queryEmbedding, embArray);
-    console.log(`Score for "${faq[i].q}": ${score.toFixed(4)} (dimension: ${embArray.length})`);
     
     if (score > bestScore) {
       bestScore = score;
@@ -388,14 +396,14 @@ export async function answerQuestion(query: string): Promise<string | { type: "n
   }
   
   console.log(`Best match: index ${bestIndex}, score ${bestScore.toFixed(4)}`);
-
-  // Only use the FAQ answer if it meets the threshold
+  
   if (bestScore >= SIMILARITY_THRESHOLD && bestIndex >= 0) {
     bestAnswer = faq[bestIndex].a;
     console.log(`Using FAQ answer: "${faq[bestIndex].q}" (similarity: ${bestScore.toFixed(4)})`);
   } else {
     console.log("No FAQ match found, using default answer");
   }
-
+  
   return bestAnswer;
 }
+
