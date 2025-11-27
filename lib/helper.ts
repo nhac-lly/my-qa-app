@@ -1,11 +1,11 @@
 import fs from "fs";
 import path from "path";
 import Papa from "papaparse";
-import { pipeline } from "@xenova/transformers";
+import { pipeline } from '@huggingface/transformers';
 import { queryArobidMCP } from "./mcp-client";
 
 // Load embedding model once
-const embedder = await pipeline("feature-extraction", "Xenova/all-MiniLM-L6-v2");
+const embedder = await pipeline("feature-extraction");
 
 type CsvRow = {
   ["CÂU HỎI GỐC"]?: string;
