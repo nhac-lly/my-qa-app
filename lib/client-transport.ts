@@ -1,6 +1,6 @@
 "use client";
 
-import { answerQuestion } from "./helper-client";
+import { answerQuestion } from "./helper-client2";
 import { DefaultChatTransport, type UIMessage, type UIMessageChunk } from "ai";
 
 type MessageContentPart = {

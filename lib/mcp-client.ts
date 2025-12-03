@@ -42,8 +42,26 @@ interface MCPResponse {
 /**
  * Parse Server-Sent Events (SSE) format text
  * SSE format: event: <event_type>\ndata: <json_data>\n\n
+ * Also handles single-line format: data: <json_data>
  */
 function parseSSEText(text: string): MCPResponse {
+  // Trim the text first
+  text = text.trim();
+  
+  // Handle single-line format: "data: {...}"
+  if (text.startsWith("data: ")) {
+    const jsonData = text.substring(6); // Remove "data: " prefix
+    try {
+      const parsed = JSON.parse(jsonData) as MCPResponse;
+      console.log("[mcp-client] Successfully parsed single-line SSE response");
+      return parsed;
+    } catch (error) {
+      console.error("[mcp-client] Failed to parse single-line SSE data as JSON:", jsonData.substring(0, 200));
+      throw new Error(`Failed to parse SSE response: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  
+  // Handle multi-line SSE format
   const lines = text.split("\n");
   
   let jsonData = "";
@@ -69,29 +87,35 @@ function parseSSEText(text: string): MCPResponse {
   }
   
   if (!jsonData) {
+    console.error("[mcp-client] No data found in SSE response. Text:", text.substring(0, 200));
     throw new Error("No data found in SSE response");
   }
   
   try {
-    return JSON.parse(jsonData) as MCPResponse;
+    const parsed = JSON.parse(jsonData) as MCPResponse;
+    console.log("[mcp-client] Successfully parsed multi-line SSE response");
+    return parsed;
   } catch (error) {
-    console.error("[mcp-client] Failed to parse SSE data as JSON:", jsonData);
+    console.error("[mcp-client] Failed to parse SSE data as JSON:", jsonData.substring(0, 500));
     throw new Error(`Failed to parse SSE response: ${error instanceof Error ? error.message : String(error)}`);
   }
 }
 
 /**
- * Parse response - handles both JSON and SSE formats
+ * Parse response text - handles both JSON and SSE formats
  */
-async function parseMCPResponse(response: Response): Promise<MCPResponse> {
-  const contentType = response.headers.get("content-type") || "";
-  
-  // Read response as text first (can only read once)
-  const text = await response.text();
+function parseMCPResponseFromText(text: string, contentType: string): MCPResponse {
+  if (!text || text.trim().length === 0) {
+    throw new Error("Response body is empty");
+  }
   
   // Check if it's SSE format by content
   if (text.startsWith("event:") || text.includes("data: ")) {
-    return parseSSEText(text);
+    try {
+      return parseSSEText(text);
+    } catch (error) {
+      throw new Error(`Failed to parse SSE response: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
   
   // Try to parse as JSON
@@ -100,10 +124,14 @@ async function parseMCPResponse(response: Response): Promise<MCPResponse> {
   } catch (error) {
     // If JSON parsing fails but content-type suggests SSE, try SSE format
     if (contentType.includes("text/event-stream") || contentType.includes("text/plain")) {
-      return parseSSEText(text);
+      try {
+        return parseSSEText(text);
+      } catch (sseError) {
+        throw new Error(`Failed to parse response as both JSON and SSE: JSON error: ${error instanceof Error ? error.message : String(error)}, SSE error: ${sseError instanceof Error ? sseError.message : String(sseError)}`);
+      }
     }
-    // Re-throw original error
-    throw new Error(`Failed to parse response: ${error instanceof Error ? error.message : String(error)}`);
+    // Re-throw original error with more context
+    throw new Error(`Failed to parse JSON response: ${error instanceof Error ? error.message : String(error)}. Response preview: ${text.substring(0, 200)}`);
   }
 }
 
@@ -138,11 +166,41 @@ export async function callMCPTool(
       toolName,
     });
 
-    const response = await fetch(AROBID_MCP_URL, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(request),
-    });
+    let response: Response;
+    let timeoutId: ReturnType<typeof setTimeout> | null = null;
+    try {
+      // Create abort controller for timeout
+      const controller = new AbortController();
+      timeoutId = setTimeout(() => controller.abort(), 30000); // 30 second timeout
+      
+      response = await fetch(AROBID_MCP_URL, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(request),
+        signal: controller.signal,
+      });
+      
+      if (timeoutId) {
+        clearTimeout(timeoutId);
+        timeoutId = null;
+      }
+    } catch (fetchError) {
+      // Clean up timeout if still active
+      if (timeoutId) {
+        clearTimeout(timeoutId);
+      }
+      
+      // Handle network errors
+      if (fetchError instanceof TypeError && fetchError.message.includes("fetch")) {
+        console.error(`[mcp-client] Network error when calling MCP tool ${toolName}:`, fetchError.message);
+        throw new Error(`Network error: ${fetchError.message}`);
+      }
+      if (fetchError instanceof Error && fetchError.name === "AbortError") {
+        console.error(`[mcp-client] MCP tool call ${toolName} timed out after 30 seconds`);
+        throw new Error("Request timed out");
+      }
+      throw fetchError;
+    }
 
     if (!response.ok) {
       const errorText = await response.text().catch(() => "Unknown error");
@@ -150,23 +208,65 @@ export async function callMCPTool(
       throw new Error(`MCP request failed: ${response.status} ${response.statusText} - ${errorText}`);
     }
 
-    const data = await parseMCPResponse(response);
+    // Read response text first
+    const responseText = await response.text().catch(() => {
+      throw new Error("Failed to read response body");
+    });
+
+    if (!responseText) {
+      throw new Error("Response body is empty");
+    }
+
+    // Parse the response
+    const contentType = response.headers.get("content-type") || "";
+    let data: MCPResponse;
+    try {
+      data = parseMCPResponseFromText(responseText, contentType);
+    } catch (parseError) {
+      console.error(`[mcp-client] Failed to parse MCP response for tool ${toolName}:`, parseError);
+      console.error("[mcp-client] Response content:", responseText.substring(0, 500));
+      throw new Error(`Failed to parse response: ${parseError instanceof Error ? parseError.message : String(parseError)}`);
+    }
 
     if (data.error) {
+      console.error(`[mcp-client] MCP server returned error for tool ${toolName}: ${data.error.message} (code: ${data.error.code})`);
+      if (data.error.data) {
+        console.error("[mcp-client] Error data:", data.error.data);
+      }
       throw new Error(`MCP error: ${data.error.message} (code: ${data.error.code})`);
     }
 
     return data.result;
   } catch (error) {
     console.error(`[mcp-client] Error calling MCP tool ${toolName}:`, error);
+    if (error instanceof Error) {
+      console.error("[mcp-client] Error details:", {
+        name: error.name,
+        message: error.message,
+        stack: error.stack,
+      });
+    }
     throw error;
   }
 }
 
 /**
+ * Cache for MCP tools to avoid repeated calls
+ */
+let cachedTools: string[] | null = null;
+let toolsCacheTime: number = 0;
+const TOOLS_CACHE_TTL = 60000; // 1 minute cache
+
+/**
  * List available tools from the MCP server
  */
 export async function listMCPTools(): Promise<string[]> {
+  // Return cached tools if available and not expired
+  const now = Date.now();
+  if (cachedTools !== null && (now - toolsCacheTime) < TOOLS_CACHE_TTL) {
+    console.log("[mcp-client] Returning cached MCP tools:", cachedTools);
+    return cachedTools;
+  }
   try {
     const request: MCPRequest = {
       jsonrpc: "2.0",
@@ -186,29 +286,127 @@ export async function listMCPTools(): Promise<string[]> {
       method: "tools/list",
     });
 
-    const response = await fetch(AROBID_MCP_URL, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(request),
-    });
+    let response: Response;
+    let timeoutId: ReturnType<typeof setTimeout> | null = null;
+    try {
+      // Create abort controller for timeout
+      const controller = new AbortController();
+      timeoutId = setTimeout(() => controller.abort(), 30000); // 30 second timeout
+      
+      response = await fetch(AROBID_MCP_URL, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(request),
+        signal: controller.signal,
+      });
+      
+      if (timeoutId) {
+        clearTimeout(timeoutId);
+        timeoutId = null;
+      }
+    } catch (fetchError) {
+      // Clean up timeout if still active
+      if (timeoutId) {
+        clearTimeout(timeoutId);
+      }
+      
+      // Handle network errors (CORS, connection refused, timeout, etc.)
+      if (fetchError instanceof TypeError && fetchError.message.includes("fetch")) {
+        console.error("[mcp-client] Network error when calling MCP server:", fetchError.message);
+        console.error("[mcp-client] This could be due to:", {
+          cors: "CORS policy blocking the request",
+          connection: "MCP server is not reachable",
+          timeout: "Request timed out",
+          url: AROBID_MCP_URL,
+        });
+        return [];
+      }
+      if (fetchError instanceof Error && fetchError.name === "AbortError") {
+        console.error("[mcp-client] MCP request timed out after 30 seconds");
+        return [];
+      }
+      throw fetchError;
+    }
 
     if (!response.ok) {
       const errorText = await response.text().catch(() => "Unknown error");
       console.error(`[mcp-client] MCP request failed: ${response.status} ${response.statusText}`, errorText);
-      throw new Error(`MCP request failed: ${response.status} ${response.statusText} - ${errorText}`);
+      console.error("[mcp-client] Response headers:", Object.fromEntries(response.headers.entries()));
+      return [];
     }
 
-    const data = await parseMCPResponse(response);
+    // Read response text first so we can log it if parsing fails
+    const responseText = await response.text().catch(() => {
+      console.error("[mcp-client] Failed to read response body");
+      return "";
+    });
+
+    if (!responseText) {
+      console.error("[mcp-client] Response body is empty");
+      return [];
+    }
+
+    let data: MCPResponse;
+    try {
+      // Parse the response text
+      const contentType = response.headers.get("content-type") || "";
+      data = parseMCPResponseFromText(responseText, contentType);
+    } catch (parseError) {
+      console.error("[mcp-client] Failed to parse MCP response:", parseError);
+      console.error("[mcp-client] Response content:", responseText.substring(0, 500));
+      return [];
+    }
 
     if (data.error) {
-      throw new Error(`MCP error: ${data.error.message} (code: ${data.error.code})`);
+      console.error(`[mcp-client] MCP server returned error: ${data.error.message} (code: ${data.error.code})`);
+      if (data.error.data) {
+        console.error("[mcp-client] Error data:", data.error.data);
+      }
+      return [];
     }
 
     // Extract tool names from the result
-    const tools = data.result as { tools?: Array<{ name: string }> };
-    return tools?.tools?.map((tool) => tool.name) || [];
+    // Handle both direct tools array and nested structure
+    let toolsArray: Array<{ name: string }> | undefined;
+    
+    if (Array.isArray(data.result)) {
+      // Result is directly an array of tools
+      toolsArray = data.result;
+    } else if (data.result && typeof data.result === "object" && "tools" in data.result) {
+      // Result has a tools property
+      const toolsObj = data.result as { tools?: Array<{ name: string }> };
+      toolsArray = toolsObj.tools;
+    }
+    
+    if (!toolsArray || !Array.isArray(toolsArray) || toolsArray.length === 0) {
+      console.warn("[mcp-client] MCP response does not contain tools array. Result structure:", {
+        resultType: typeof data.result,
+        isArray: Array.isArray(data.result),
+        resultKeys: data.result && typeof data.result === "object" ? Object.keys(data.result) : [],
+        resultPreview: JSON.stringify(data.result).substring(0, 200),
+      });
+      return [];
+    }
+    
+    const toolNames = toolsArray
+      .map((tool) => (typeof tool === "string" ? tool : tool.name))
+      .filter((name): name is string => typeof name === "string" && name.length > 0);
+    console.log("[mcp-client] Successfully retrieved MCP tools:", toolNames);
+    
+    // Cache the tools
+    cachedTools = toolNames;
+    toolsCacheTime = Date.now();
+    
+    return toolNames;
   } catch (error) {
-    console.error("[mcp-client] Error listing MCP tools:", error);
+    console.error("[mcp-client] Unexpected error listing MCP tools:", error);
+    if (error instanceof Error) {
+      console.error("[mcp-client] Error details:", {
+        name: error.name,
+        message: error.message,
+        stack: error.stack,
+      });
+    }
     return [];
   }
 }
@@ -238,105 +436,56 @@ export function isArobidRelatedQuery(query: string): boolean {
 }
 
 /**
- * Extract email from query if present
- */
-function extractEmail(query: string): string | null {
-  const emailRegex = /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b/;
-  const match = query.match(emailRegex);
-  return match ? match[0] : null;
-}
-
-/**
- * Get guidance response for Arobid-related queries
- * This provides helpful information and instructions without executing actions
- * Note: This is an informational Q&A chatbot, not an autonomous agent
- */
-function getArobidGuidanceResponse(query: string): string | null {
-  const normalizedQuery = query.toLowerCase();
-
-  // Handle password reset queries
-  if (
-    normalizedQuery.includes("reset") ||
-    normalizedQuery.includes("forgot") ||
-    normalizedQuery.includes("change password")
-  ) {
-    const email = extractEmail(query);
-    if (email) {
-      return `To reset your password for ${email}, you'll need to use the Arobid platform. The process involves: 1) Requesting a password reset, 2) Receiving an OTP code via email, 3) Verifying the OTP, and 4) Setting a new password. Please visit the Arobid website or contact support for assistance with password reset.`;
-    }
-    return "To reset your password, you'll need to provide your email address on the Arobid platform. The system will send you an OTP code via email that you'll need to verify before setting a new password. Please visit the Arobid website for password reset assistance.";
-  }
-
-  // Handle login queries
-  if (
-    normalizedQuery.includes("login") ||
-    normalizedQuery.includes("sign in") ||
-    normalizedQuery.includes("log in")
-  ) {
-    const email = extractEmail(query);
-    if (email) {
-      return `To log in to Arobid with ${email}, you'll need to: 1) Visit the Arobid login page, 2) Enter your email and password, 3) After authentication, check your email for an OTP code, 4) Enter the OTP code to complete login. Please use the Arobid platform directly for login.`;
-    }
-    return "To log in to Arobid, you'll need to visit the Arobid platform and provide your email and password. After authentication, you'll receive an OTP code via email that you'll need to verify to complete the login process.";
-  }
-
-  // Handle account creation queries
-  if (
-    normalizedQuery.includes("create") ||
-    normalizedQuery.includes("register") ||
-    normalizedQuery.includes("sign up") ||
-    normalizedQuery.includes("signup") ||
-    normalizedQuery.includes("new account")
-  ) {
-    return "To create an Arobid account, you'll need to provide: your email address, a secure password, first name, last name, title (Mr or Mrs), phone number, and nationality code (2-letter country code like VN, US, etc.). After account creation, you'll receive an OTP code via email for verification. Please visit the Arobid registration page to create your account.";
-  }
-
-  // Handle verification/OTP queries
-  if (
-    normalizedQuery.includes("verify") ||
-    normalizedQuery.includes("otp") ||
-    normalizedQuery.includes("verification code")
-  ) {
-    return "To verify your Arobid account, you'll need to provide your email address and the 6-digit OTP code you received via email. The OTP code is valid for a limited time. Please use the Arobid platform's verification page to complete this process.";
-  }
-
-  // Generic Arobid information
-  if (normalizedQuery.includes("arobid")) {
-    return "Arobid provides user account management services including account creation, login, password reset, and email verification. I can provide information and guidance about these services. For actual account operations, please visit the Arobid platform directly. How can I help you with Arobid services?";
-  }
-
-  // If no specific match, return null to use default fallback
-  return null;
-}
-
-/**
- * Query the Arobid MCP server for information related to a user query
- * This function intelligently routes queries to appropriate MCP tools
+ * Query the Arobid MCP server as an autonomous agent
+ * This function intelligently routes queries to appropriate MCP tools and executes actions
  * In a Next.js web app, we make HTTP requests to the MCP server
  */
+/**
+ * Check if MCP tools are available (uses cache)
+ */
+export async function hasMCPTools(): Promise<boolean> {
+  try {
+    const tools = await listMCPTools();
+    return tools.length > 0;
+  } catch (error) {
+    console.error("[mcp-client] Error checking MCP tools:", error);
+    return false;
+  }
+}
+
 export async function queryArobidMCP(query: string): Promise<string | null> {
   try {
+    console.log("[mcp-client] queryArobidMCP called with query:", query);
+    
     // Check if query is related to Arobid features
     if (!isArobidRelatedQuery(query)) {
       console.log("[mcp-client] Query not related to Arobid features");
       return null;
     }
 
-    // List available tools from MCP server
-    const tools = await listMCPTools();
-    console.log("[mcp-client] Available Arobid MCP tools:", tools);
-
-    if (tools.length === 0) {
-      console.log("[mcp-client] No MCP tools available, using guidance responses");
-      // Fall back to guidance responses if no tools available
-      return getArobidGuidanceResponse(query);
+    console.log("[mcp-client] Query is Arobid-related, checking MCP tools...");
+    
+    // Check if MCP tools are available
+    const toolsAvailable = await hasMCPTools();
+    
+    if (!toolsAvailable) {
+      console.log("[mcp-client] No MCP tools available, returning null to fallback to FAQ");
+      return null;
     }
 
-    // For now, provide guidance responses based on query intent
-    // In the future, you could call actual MCP tools here using callMCPTool()
-    return getArobidGuidanceResponse(query);
+    console.log("[mcp-client] MCP tools are available. MCP should handle this query.");
+    // MCP tools are available - return null to indicate MCP should handle this
+    // The helper functions will check if MCP tools are available and handle accordingly
+    return null;
   } catch (error) {
-    console.error("[mcp-client] Error querying Arobid MCP:", error);
+    console.error("[mcp-client] Unexpected error in queryArobidMCP:", error);
+    if (error instanceof Error) {
+      console.error("[mcp-client] Error details:", {
+        name: error.name,
+        message: error.message,
+        stack: error.stack?.substring(0, 500),
+      });
+    }
     // Return null on error to allow fallback to default answer
     return null;
   }

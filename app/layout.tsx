@@ -4,7 +4,10 @@ import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
 import { AssistantRuntimeProvider } from "@assistant-ui/react";
 import { useChatRuntime } from "@assistant-ui/react-ai-sdk";
-import { ClientSideTransport } from "@/lib/client-transport";
+import { ClientSideTransport3 } from "@/lib/client-transport3";
+import { initialize as initializeDeepSeek } from "@/lib/helper-client3";
+import { MCPToolsRegistry } from "@/components/mcp-tools-registry";
+import { RegistrationToolTrigger } from "@/components/registration-tool-trigger";
 import * as Dialog from "@radix-ui/react-dialog";
 import { useState, useEffect } from "react";
 import { Thread } from "@/components/assistant-ui/thread";
@@ -69,10 +72,19 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
 
   // Create runtime at layout level - this preserves chat context across modal open/close
   // The runtime persists as long as the layout component exists
-  // Use client-side transport implementing required methods
+  // Use helper-client3 (DeepSeek R1) for AI inference
   const runtime = useChatRuntime({
-    transport: new ClientSideTransport(),
+    transport: new ClientSideTransport3(),
   });
+
+  // Initialize DeepSeek model when component mounts
+  useEffect(() => {
+    initializeDeepSeek((progress) => {
+      console.log("[layout] DeepSeek loading progress:", progress);
+    }).catch((error) => {
+      console.error("[layout] Failed to initialize DeepSeek:", error);
+    });
+  }, []);
 
   // Save chat state to localStorage when it changes
   useEffect(() => {
@@ -87,6 +99,8 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
       <body className={`${geistSans.variable} ${geistMono.variable}`}>
         {/* Wrap everything with AssistantRuntimeProvider so it never unmounts */}
         <AssistantRuntimeProvider runtime={runtime}>
+          <MCPToolsRegistry />
+          <RegistrationToolTrigger />
           {children}
           {/* Floating button to open modal */}
           <button
