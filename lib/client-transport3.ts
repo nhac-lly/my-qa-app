@@ -1,6 +1,6 @@
 "use client";
 
-import { answerQuestion } from "./helper-client3";
+import { answerQuestion } from "./helper-client4";
 import { listMCPTools, callMCPTool } from "./mcpclient2";
 import { DefaultChatTransport, type UIMessage, type UIMessageChunk } from "ai";
 
@@ -18,7 +18,7 @@ type MessageLike = UIMessage & {
 };
 
 /**
- * Custom transport that uses helper-client3 (DeepSeek R1) for AI inference
+ * Custom transport that uses helper-client4 (Gemini API) for AI inference
  * Pure AI inference - no QnA or MCP functionality
  */
 export class ClientSideTransport3<UI_MESSAGE extends UIMessage = UIMessage> extends DefaultChatTransport<UI_MESSAGE> {
@@ -27,7 +27,7 @@ export class ClientSideTransport3<UI_MESSAGE extends UIMessage = UIMessage> exte
     super({ api: "" });
   }
 
-  // Override sendMessages to use helper-client3 with MCP tool support
+  // Override sendMessages to use helper-client4 (Gemini API) with MCP tool support
   async sendMessages({ messages }: Parameters<DefaultChatTransport<UI_MESSAGE>["sendMessages"]>[0]): Promise<ReadableStream<UIMessageChunk>> {
     // Get the last user message
     const lastMessage = messages[messages.length - 1] as MessageLike | undefined;
@@ -189,7 +189,7 @@ export class ClientSideTransport3<UI_MESSAGE extends UIMessage = UIMessage> exte
             enhancedQuery = `Available MCP tools:\n${toolsDescription}\n\nUser query: ${userQuery}\n\nIMPORTANT: If the user wants to register or create a new account, you should use the "register-new-user-account" tool. This tool requires a form to be filled out by the user. Tell the user you will show them a registration form.`;
           }
           
-          // Get answer from helper-client3 (DeepSeek R1)
+          // Get answer from helper-client4 (Gemini API)
           let answerText = await answerQuestion(enhancedQuery);
           
           // Only check for tool calls if the query actually needs tools
